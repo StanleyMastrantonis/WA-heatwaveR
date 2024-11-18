@@ -1,0 +1,636 @@
+---
+title: "heatwaveR"
+author: "SM"
+format: docx
+editor: visual
+execute:
+  eval: true
+  output: true
+---
+
+## Libraries
+
+```{r}
+shhh = suppressPackageStartupMessages # It's a library, so shhh!
+library(heatwaveR) # For detecting MHWs
+shhh(library(sf))
+shhh(library(lubridate)) # Useful functions for dealing with dates
+library(ggplot2) # The preferred library for data visualisation
+library(tidync) # For easily dealing with NetCDF data
+library(rerddap) # For easily downloading subsets of data
+library(doParallel) # For parallel processing
+library(stringr) # for string wrapping
+```
+
+## Read in the DPIRD Bioregions shapefile
+
+```{r}
+#| label: dprid regions
+#| output: asis
+setwd(getwd()) # set to git wd
+wa_sf = st_read(".//Data//DPIRD_Bioregions_DPIRD_095.shp", quiet = TRUE) %>%
+        st_transform(crs = 4326) # OISST is WGS84
+plot(st_geometry(wa_sf)) # plot the geoms
+bbox = st_bbox(wa_sf) # get the bounding box for heatwaveR
+print(bbox)
+```
+
+## Download OISST data
+
+```{r}
+# Date download range by start and end dates per year
+dl_years = data.frame(date_index = 1:6,     # can only dl in chunks of ~7 years
+          start = c("1982-01-01", "1990-01-01", 
+          "1998-01-01", "2006-01-01", "2014-01-01", "2020-01-01"),
+          end = c("1989-12-31", "1997-12-31", 
+          "2005-12-31", "2013-12-31", "2019-12-31", "2023-12-31"))
+```
+
+```{r}
+#| eval: false
+# This function downloads and prepares data based on user provided start and end dates
+
+#### MAY TAKE SOME TIME ###
+###########################
+OISST_sub_dl = function(time_df){
+   OISST_dat = rerddap::griddap(datasetx = "ncdcOisst21Agg_LonPM180",
+                                url = "https://coastwatch.pfeg.noaa.gov/erddap/", 
+                                time = c(time_df$start, time_df$end), 
+                                zlev = c(0, 0),
+                                latitude = c(bbox[2], bbox[4]), # from bbox
+                                longitude = c(bbox[1], bbox[3]), # from bbox
+                                fields = "sst")$data %>% 
+    dplyr::mutate(time = base::as.Date(stringr::str_remove(time, "T12:00:00Z")))%>%
+    dplyr::rename(t = time, temp = sst, lon = longitude, lat = latitude) %>% 
+    dplyr::select(lon, lat, t, temp) %>% 
+    stats::na.omit()
+}
+
+```
+
+```{r}
+#| eval: false
+#year_range = OISST_sub_dl(dl_years[1,]) if you want to test a chunk
+
+## this will take some time to download##
+########################################
+OISST_data = dl_years %>% 
+    dplyr::group_by(date_index) %>% 
+    dplyr::group_modify(~OISST_sub_dl(.x)) %>% 
+    dplyr::ungroup() %>% 
+    dplyr::select(lon, lat, t, temp)
+#base::saveRDS(OISST_data, file = ".//Data//Downloads//WA_temp.Rds")
+
+# Save the data as an .Rds file 
+base::saveRDS(OISST_data, file = ".//Data//Downloads//WA_temp.Rds")
+```
+
+```{r}
+
+OISST_data = readRDS(".//Data//Downloads//WA_temp.Rds")
+
+## quick plot of a day to check
+OISST_data %>% 
+  dplyr::filter(t == "1994-12-01") %>% 
+  ggplot2::ggplot(aes(x = lon, y = lat)) +
+  ggplot2::geom_tile(aes(fill = temp)) +
+  # ggplot2::borders() + # Activate this line to see the global map
+  ggplot2::scale_fill_viridis_c() +
+  ggplot2::coord_quickmap(expand = F) +
+  ggplot2::labs(x = NULL, y = NULL, fill = "SST (°C)") +
+  ggplot2::theme(legend.position = "bottom")
+
+```
+
+## Heatwave detection at sharkbay
+
+```{r}
+selected_data = OISST_data %>%
+                dplyr::filter(lon == 112.875 & lat == -25.625) # for one coordinate
+
+plt_clim  = heatwaveR::ts2clm(data = selected_data, # percentiles is 90% default
+                       climatologyPeriod = c("1982-01-01", "2011-01-01"))
+
+plt_event = heatwaveR::detect_event(data = plt_clim, # duration is 5 days default
+                       categories = TRUE, climatology = TRUE) 
+
+suppressMessages(event_line(plt_event, spread = 100, start_date = "1982-01-01",
+           end_date = "2023-12-31", category = TRUE))
+```
+
+```{r}
+lolli_plot(plt_event)
+```
+
+## Heatwave detection for WA gridded data
+
+```{r}
+## heatwaveR function to apply across gridded data ##
+
+## this is the event only function ##
+event_only = function(df){
+  # First calculate the percentiles (90th by default)
+  clim = heatwaveR::ts2clm(data = df, 
+                            climatologyPeriod = c("1982-01-01", "2011-01-01"))
+  # Then the events
+  event = heatwaveR::detect_event(data = clim, ## default is 5 day duration
+                                   categories = TRUE, climatology = TRUE)
+  # Return event metric dataframe of results
+  return(event$event)
+}
+
+## for events blocked by year
+block_av = function(df){
+  # First calculate the percentiles (90th by default)
+  clim = heatwaveR::ts2clm(data = df, 
+                            climatologyPeriod = c("1982-01-01", "2011-01-01"))
+  # Then the events
+  event = heatwaveR::detect_event(data = clim, ## default is 5 day duration
+                                   categories = TRUE, climatology = TRUE)
+  block = block_average(event)
+  # Return only the event metric dataframe of results
+  return(block$event)
+}
+
+```
+
+```{r}
+# if you want to read it in
+#OISST_data = readRDS(".//Data//Downloads//WA_temp.Rds")
+```
+
+```{r}
+#| eval: false
+# if you want parrellel, use your cores -1
+#registerDoParallel(cores = 7)
+
+# Detect events
+
+MHW_result = suppressMessages(plyr::ddply(.data = OISST_data, 
+                              .variables = c("lon", "lat"),
+                              .fun =   event_only, .parallel = FALSE))
+# Save the results as an .Rds file 
+base::saveRDS(MHW_result, file = ".//Results//WA_MHW.Rds")
+#write.csv(MHW_result , ".//Results//WA_MHW.csv')
+```
+
+```{r}
+# read the mhw rds
+MHW_result = readRDS(".//Results//WA_MHW.Rds")
+```
+
+## Convert MHW results to spatial
+
+```{r}
+MHW_sf = MHW_result %>%
+         st_as_sf(coords = c("lon", "lat"), crs = 4326) %>% # convert to sf
+         st_intersection(wa_sf) # clip by the DPIRD bioregions
+
+```
+
+```{r}
+# Add lat/lon columns to the sf object
+MHW_sf = MHW_sf %>%
+    dplyr::mutate(
+    lon = st_coordinates(.)[, "X"],
+    lat = st_coordinates(.)[, "Y"]
+  )
+
+MHW = dplyr::tibble(MHW_sf) # and convert back to tibble
+```
+
+## Area calculation of OISST grid cells
+
+### Assuming length and width at equator
+
+```{r}
+# Define the area of one 0.25-degree grid cell in km²
+grid_cell_width_km = 0.25 * 111  # Width of the grid cell in km
+grid_cell_height_km = 0.25 * 111  # Height of the grid cell in km
+grid_cell_area_km2 = grid_cell_width_km * grid_cell_height_km  # Area of the grid                                                                 # cell in km²
+```
+
+## Merging the data based on each event detected
+
+```{r}
+category_rank = c(
+  "I Moderate" = 1,
+  "II Strong"  = 2,
+  "III Severe" = 3,
+  "IV Extreme" = 4
+)
+
+# Perform the summary statistics
+OISST_summary = MHW %>%
+  dplyr::mutate(
+    category_rank = category_rank[category])%>% ## adding an ordinal rank to                                                           category
+  dplyr::group_by(event_name) %>%
+  tidyr::drop_na() %>% # this will drop moderate events
+  dplyr::summarise(
+    num_events = dplyr::n(),  # Count the number of rows (events) within each event
+    intensity = mean(intensity_mean, na.rm = TRUE),  # the mean intensity of the                                                          event
+    duration = max(duration, na.rm = TRUE),  # Maximum duration
+    area_km2 = num_events * grid_cell_area_km2,  # Total area covered in km²
+    category = category[which.max(category_rank)], # category of events
+    .groups = "drop"
+  ) %>%
+  
+  dplyr::arrange(event_name) %>%  # Arrange the results by season
+  dplyr::mutate(label = str_remove(event_name, "^Event ")) %>%
+  dplyr::mutate(
+    category = dplyr::recode(category, ## adding labels based on category
+                      "I Moderate" = "Moderate",
+                      "II Strong" = "Strong",
+                      "III Severe" = "Severe",
+                      "IV Extreme" = "Extreme"
+    ),
+    category_colors = dplyr::recode(category,
+                   "Moderate" = "gold2",
+                   "Strong" = "orange",
+                   "Severe" = "red",
+                   "Extreme" = "darkred")
+  )
+
+print(OISST_summary) 
+```
+
+## Filtering the data
+
+```{r}
+# Calculate thresholds for filtering
+thresholds = OISST_summary %>%
+  dplyr::summarise(
+    intensity_thresh = quantile(intensity, 0.90, na.rm = TRUE),
+    duration_thresh = quantile(duration, 0.90, na.rm = TRUE),
+    area_km2_thresh = quantile(area_km2, 0.90, na.rm = TRUE)
+  )
+
+# Filter for one of the thresholds above 
+OISST_results = OISST_summary %>%
+  dplyr::filter(
+      #intensity >= thresholds$intensity_thresh 
+      duration >= thresholds$duration_thresh 
+      #area_km2 >= thresholds$area_km2_thresh 
+  )
+```
+
+```{r}
+
+subset = dplyr::tibble(read.csv('subset.csv'))
+
+subset =  subset %>%
+          dplyr::mutate(Category = dplyr::recode(Category,
+                           "Moderate" = "I Moderate",
+                           "Strong" = "II Strong",
+                           "Severe" = "III Severe",
+                           "Extreme" = "IV Extreme"))  # Adjust as necessary
+
+# Prepare MHW dataset by extracting year and peak month
+MHW <- MHW %>%
+  #dplyr::select(-geometry) %>%
+  dplyr::mutate(Year = as.numeric(format(date_peak, "%Y")),  # Extract year
+         Peak.Month = format(date_peak, "%B")) %>%
+  dplyr::mutate(across(c(category, Peak.Month), ~ trimws(.)))  # Trim whitespace
+
+# Ensure subset columns are also trimmed
+subset <- subset %>%
+  dplyr::mutate(across(c(Category, Peak.month), ~ trimws(.)))
+
+# Perform inner join
+matched_events <- MHW %>%
+  dplyr::inner_join(subset, by = c("Year" = "Year", 
+                             "category" = "Category",
+                             "Peak.Month" = "Peak.month"))
+
+# Select the longest events for 2020 and 2021
+longest_events_2020_2021 <- matched_events %>%
+  dplyr::filter(Year %in% c(2020, 2021)) %>%
+  dplyr::group_by(Year) %>%
+  dplyr::slice(which.max(duration)) %>%
+  dplyr::ungroup()
+
+# Combine with all other events
+final_events <- matched_events %>%
+  dplyr::filter(!Year %in% c(2020, 2021)) %>%
+  dplyr::bind_rows(longest_events_2020_2021)
+
+# Print the final matched events
+print(final_events)
+
+# Print the matched events
+#print(matched_events)
+
+```
+
+```{r}
+unique(MHW$category)
+unique(MHW$Peak.Month)
+unique(subset$Category)
+unique(subset$Peak.month)
+```
+
+```{r}
+category_rank = c(
+  "I Moderate" = 1,
+  "II Strong"  = 2,
+  "III Severe" = 3,
+  "IV Extreme" = 4
+)
+
+# Perform the summary statistics
+OISST_summary = final_events %>%
+  dplyr::mutate(
+    category_rank = category_rank[category])%>% ## adding an ordinal rank to                                                           category
+  dplyr::group_by(event_name) %>%
+  tidyr::drop_na() %>% # this will drop moderate events
+  dplyr::summarise(
+    num_events = dplyr::n(),  # Count the number of rows (events) within each event
+    intensity = mean(intensity_max, na.rm = TRUE),  # the mean intensity of the                                                          event
+    duration = max(duration, na.rm = TRUE),  # Maximum duration
+    area_km2 = num_events * grid_cell_area_km2,  # Total area covered in km²
+    category = category[which.max(category_rank)], # category of events
+    .groups = "drop"
+  ) %>%
+  
+  dplyr::arrange(event_name) %>%  # Arrange the results by season
+  dplyr::mutate(label = str_remove(event_name, "^Event ")) %>%
+  dplyr::mutate(
+    category = dplyr::recode(category, ## adding labels based on category
+                      "I Moderate" = "Moderate",
+                      "II Strong" = "Strong",
+                      "III Severe" = "Severe",
+                      "IV Extreme" = "Extreme"
+    ),
+    category_colors = dplyr::recode(category,
+                   "Moderate" = "gold2",
+                   "Strong" = "orange",
+                   "Severe" = "red",
+                   "Extreme" = "darkred")
+  ) 
+
+
+
+print(OISST_summary) 
+```
+
+```{r}
+# Extract year from event_name and summarize the data
+summary_results <- OISST_summary %>%
+  dplyr::mutate(Year = as.numeric(sub(".*? (\\d{4})", "\\1", as.character(event_name)))) %>%  # Extract year
+  dplyr::group_by(Year) %>%
+  dplyr::summarise(
+    total_events = sum(num_events, na.rm = TRUE),
+    duration = sum(duration, na.rm = TRUE),
+    area_km = sum(area_km2, na.rm = TRUE),
+    duration = max(duration, na.rm = TRUE),
+    intensity = max(intensity, na.rm = TRUE),
+    category = dplyr::case_when(
+      max(category) == "Extreme" ~ "Extreme",
+      max(category) == "Severe" ~ "Severe",
+      max(category) == "Strong" ~ "Strong",
+      TRUE ~ NA_character_
+    ),
+    .groups = 'drop'  # Avoid grouping issues in the output
+  )
+summary_results = summary_results %>%
+                  dplyr::filter(!is.na(Year))
+
+# Print the summary results
+print(summary_results)
+```
+
+```{r}
+
+```
+
+## Bubble plots
+
+```{r}
+library(ggrepel)  # For better label placement
+category_colors = c(
+  "Moderate" = "gold2",
+  "Strong" = "orange",
+  "Severe" = "red",
+  "Extreme" = "darkred"
+)    
+    
+
+# Plot with ggplot2
+ggplot(summary_results, aes(x = duration, y = intensity, size = area_km, fill = category)) +
+  geom_point(alpha = 1, stroke = 1.5, 
+             shape = 21) +  # Add bubbles with transparency
+  scale_size_continuous(name = "Area (km²)",range = c(5, 12)) +  # Adjust bubble size range
+  #,range = c(3, 20)
+  scale_fill_manual(values = category_colors, 
+                   name = "Category") +  # Custom fill color scale
+  labs(
+    title = "WA Heatwaves",
+    x = "Duration (Days)",
+    y = "Maximum Intensity",
+    size = "Area (km²)"
+  ) +
+  theme_minimal() +
+  xlim(40,180)+
+  theme(
+    panel.grid.major = element_blank(),  # Remove major grid lines
+    panel.grid.minor = element_blank(),  # Remove minor grid lines
+    panel.border = element_blank(),      # Remove panel border
+    axis.line = element_line(color = "black"),  # Add axis lines for clarity
+    legend.key = element_rect(fill = NA, color = NA),
+  ) +
+  guides(
+    fill = guide_legend(
+      override.aes = list(shape = 22, size =10)  # Use rectangle (shape = 22)
+  )) +
+  ggrepel::geom_text_repel(aes(label = Year), size = 3)
+```
+
+```{r}
+library(maps)
+library(ggpubr)
+library(tidyr)
+library(sf)
+library(stringr)
+library(patchwork)
+library(giscoR)
+
+# Plot with ggplot2
+ggplot(OISST_results, aes(x = duration, y = intensity, size = area_km2, fill = category)) +
+  geom_point(alpha = 1, stroke = 1.5, shape = 21) +  # Add bubbles with transparency
+  scale_size_continuous(name = "Area (km²)", range = c(3, 20)) +  # Adjust bubble size range
+  scale_fill_manual(values = category_colors, name = "Category") +  # Custom fill color scale
+  labs(
+    title = "WA Heatwaves",
+    x = "Duration (Days)",
+    y = "Cumulative Intensity",
+    size = "Area (km²)"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid.major = element_blank(),  # Remove major grid lines
+    panel.grid.minor = element_blank(),  # Remove minor grid lines
+    panel.border = element_blank(),      # Remove panel border
+    axis.line = element_line(color = "black"),  # Add axis lines for clarity
+    legend.key = element_rect(fill = NA, color = NA),
+    #legend.key.width = unit(1.5, "cm"),  # Increase legend key width
+    #legend.key.height = unit(1.5, "cm")  # Increase legend key height# No border around legend keys
+  ) +
+  guides(
+    fill = guide_legend(
+      override.aes = list(shape = 22, size =10)  # Use rectangle (shape = 22) in legend
+    )
+  ) +
+  ggrepel::geom_text_repel(aes(label = label), size = 3)
+
+# Ensure the category column is a factor with levels matching the color scale
+OISST_results$category <- factor(OISST_results$category, levels = names(category_colors))
+
+# Plot with ggplot2
+
+main_plot <- ggplot(OISST_results, aes(x = duration, y = intensity, size = area_km2, fill = category)) +
+  geom_point(alpha = 1, stroke = 1.5, shape = 21) +  # Add bubbles with transparency
+  scale_size_continuous(name = "Area (km²)", range = c(3, 20)) +  # Adjust bubble size range
+  scale_fill_manual(values = category_colors, name = "Category") +  # Custom fill color scale
+  labs(
+    title = "WA Heatwaves",
+    x = "Duration (Days)",
+    y = "Cumulative Intensity",
+    size = "Area (km²)"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid.major = element_blank(),  # Remove major grid lines
+    panel.grid.minor = element_blank(),  # Remove minor grid lines
+    panel.border = element_blank(),      # Remove panel border
+    axis.line = element_line(color = "black"),  # Add axis lines for clarity
+    legend.key = element_rect(fill = NA, color = NA),  # Remove border around legend keys
+    legend.text = element_text(size = 10)  # Adjust legend text size if needed
+  ) +
+  guides(
+    fill = guide_legend(
+      override.aes = list(size = 5, shape = 22)  # Increase legend key size
+    )
+  ) +
+  ggrepel::geom_text_repel(aes(label = label), size = 3)
+
+
+# overall country boundaries
+wld <- gisco_get_countries(resolution = "20")
+
+# definition of orthogonal projection
+ortho_crs <-'+proj=ortho +lat_0=-28 +lon_0=130 +x_0=0 +y_0=0 +R=6371000 +units=m +no_defs +type=crs'
+
+# creation of the ocean 
+ocean <- st_point(x = c(0,0)) %>%
+  st_buffer(dist = 3071000) %>% # radio Tierra
+  st_sfc(crs = ortho_crs)
+plot(ocean)
+
+world <-   st_intersection(wld, st_transform(ocean, 4326)) %>%
+  st_transform(crs = ortho_crs) %>% 
+  dplyr::filter(NAME_ENGL == 'Australia') %>%
+  dplyr::mutate(dummy = ifelse(NAME_ENGL == "Australia", "yes", "no"))
+
+wld_map <- ggplot(world) +
+  geom_sf(data = ocean, fill = "#deebf7", linewidth = .2) +
+  geom_sf(data = wa_sf, fill = "yellow", linewidth = .2) +
+  geom_sf(data = world, fill = "grey50", linewidth = .2) +
+  scale_fill_manual(values = c("grey50", "red")) + 
+  theme_void()
+
+main_plot + inset_element(wld_map, left = 0.65, bottom = 0.82, right = 1.1, top = 1, align_to = "full")
+
+```
+
+```         
+```
+
+```{r}
+library(scales)
+library(maps)
+library(ggpubr)
+library(tidyr)
+library(sf)
+library(stringr)
+library(patchwork)
+library(giscoR)
+
+
+category_colors = c(
+  "Moderate" = "gold2",
+  "Strong" = "orange",
+  "Severe" = "red",
+  "Extreme" = "darkred"
+)    
+
+# Plot with ggplot2
+main_plot <- ggplot(summary_results, aes(x = duration, y = intensity, size = area_km, fill = category)) +
+  geom_point(alpha = 1, stroke = 1.5, shape = 21) +  # Add bubbles with transparency
+  scale_size_continuous(
+    name = "Area (km²)",
+    range = c(5, 12),
+    labels = function(x) format(x, big.mark = ",", scientific = FALSE, nsmall = 0)  # Format labels
+  ) +  
+  scale_fill_manual(values = category_colors, name = "Category") +  # Custom fill color scale
+  labs(
+    title = "WA Marine Heatwaves",
+    x = "Duration (Days)",
+    y = "Maximum Intensity",
+    size = "Area (km²)"
+  ) +
+  theme_minimal() +
+  xlim(40, 180) +
+  ylim(1.8,5.8)+
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    panel.grid.major = element_blank(),  # Remove major grid lines
+    panel.grid.minor = element_blank(),  # Remove minor grid lines
+    panel.border = element_blank(),       # Remove panel border
+    axis.line = element_line(color = "black"),  # Add axis lines for clarity
+    legend.key = element_rect(fill = NA, color = NA)
+  ) +
+  guides(
+    fill = guide_legend(override.aes = list(shape = 22, size = 10))  # Use rectangle (shape = 22)
+  ) +
+    ggrepel::geom_text_repel(
+    aes(label = Year),
+    size = 4,  # Increase size for better visibility
+    box.padding = 0.5,  # Add space around labels
+    point.padding = 0.5,  # Add space between labels and points
+    segment.color = 'grey50',  # Color of connecting line
+    segment.size = 0.5,  # Thickness of connecting line
+    fill = "white",  # Background color
+    alpha = 0.7,  # Background transparency
+    max.overlaps = Inf  # Allow all labels to show
+  )
+  #ggrepel::geom_text_repel(aes(label = Year), size = 3)
+
+
+# overall country boundaries
+wld <- gisco_get_countries(resolution = "20")
+
+# definition of orthogonal projection
+ortho_crs <-'+proj=ortho +lat_0=-28 +lon_0=130 +x_0=0 +y_0=0 +R=6371000 +units=m +no_defs +type=crs'
+
+# creation of the ocean 
+ocean <- st_point(x = c(0,0)) %>%
+  st_buffer(dist = 3071000) %>% # radio Tierra
+  st_sfc(crs = ortho_crs)
+plot(ocean)
+
+world <-   st_intersection(wld, st_transform(ocean, 4326)) %>%
+  st_transform(crs = ortho_crs) %>% 
+  dplyr::filter(NAME_ENGL == 'Australia') %>%
+  dplyr::mutate(dummy = ifelse(NAME_ENGL == "Australia", "yes", "no"))
+
+wld_map <- ggplot(world) +
+  geom_sf(data = ocean, fill = "#deebf7", linewidth = .2) +
+  geom_sf(data = wa_sf, fill = "yellow", linewidth = .2) +
+  geom_sf(data = world, fill = "grey50", linewidth = .2) +
+  scale_fill_manual(values = c("grey50", "red")) + 
+  theme_void()
+
+main_plot + inset_element(wld_map, left = 0.08, bottom = 0.72, right =0.25, top = 0.9, align_to = "full")
+
+
+```
